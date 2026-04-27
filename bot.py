@@ -1,11 +1,11 @@
+import telebot
+from telebot import types
 import sqlite3
 import json
 import os
 import threading
 from datetime import datetime
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -13,6 +13,8 @@ ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "6011460052").split("
 
 if not BOT_TOKEN:
     raise Exception("BOT_TOKEN environment variable not set!")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
 # ========== Flask for cron ping ==========
 flask_app = Flask(__name__)
@@ -134,160 +136,182 @@ def get_all_users():
 user_states = {}
 
 # ========== Helper Functions ==========
-async def safe_edit(context, chat_id, message_id, text, reply_markup=None):
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return True
-    except:
-        return False
+def main_menu_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton("➕ New Forwarder", callback_data="new"),
+        types.InlineKeyboardButton("📋 My Forwarders", callback_data="my"),
+        types.InlineKeyboardButton("❓ Help", callback_data="help")
+    )
+    return keyboard
 
-async def send_or_edit(context, chat_id, message_id, text, reply_markup=None):
-    if message_id:
-        success = await safe_edit(context, chat_id, message_id, text, reply_markup)
-        if success:
-            return message_id
-    msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode='Markdown')
-    return msg.message_id
+def forwarder_list_keyboard(user_id):
+    forwarders = get_user_forwarders(user_id)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for f in forwarders:
+        status = "✅" if f['active'] else "⏸"
+        keyboard.add(types.InlineKeyboardButton(f"{status} Forwarder #{f['id']}", callback_data=f"view_{f['id']}"))
+    keyboard.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu"))
+    return keyboard
 
-async def copy_message(context, chat_id, msg, footer):
-    if msg.text:
-        text = msg.text
-        if footer:
-            text += f"\n\n{footer}"
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
-    elif msg.photo:
-        caption = msg.caption or ""
-        if footer:
-            caption += f"\n\n{footer}" if caption else footer
-        await context.bot.send_photo(chat_id=chat_id, photo=msg.photo[-1].file_id, caption=caption, parse_mode='HTML')
-    elif msg.video:
-        caption = msg.caption or ""
-        if footer:
-            caption += f"\n\n{footer}"
-        await context.bot.send_video(chat_id=chat_id, video=msg.video.file_id, caption=caption, parse_mode='HTML')
-    elif msg.document:
-        caption = msg.caption or ""
-        if footer:
-            caption += f"\n\n{footer}"
-        await context.bot.send_document(chat_id=chat_id, document=msg.document.file_id, caption=caption, parse_mode='HTML')
-    elif msg.voice:
-        await context.bot.send_voice(chat_id=chat_id, voice=msg.voice.file_id)
-    elif msg.sticker:
-        await context.bot.send_sticker(chat_id=chat_id, sticker=msg.sticker.file_id)
+def forwarder_detail_keyboard(forwarder_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("🔄 Toggle Mode", callback_data=f"mode_{forwarder_id}"),
+        types.InlineKeyboardButton("📝 Set Footer", callback_data=f"footer_{forwarder_id}")
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("⏸ Pause/Resume", callback_data=f"active_{forwarder_id}"),
+        types.InlineKeyboardButton("➕ Add Destination", callback_data=f"add_dest_{forwarder_id}")
+    )
+    keyboard.add(types.InlineKeyboardButton("🗑 Delete", callback_data=f"del_{forwarder_id}"))
+    keyboard.add(types.InlineKeyboardButton("🔙 Back", callback_data="my"))
+    return keyboard
 
 # ========== Command Handlers ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+@bot.message_handler(commands=['start'])
+def start(message):
+    user = message.from_user
     add_user(user.id, user.username, user.first_name)
-    
-    keyboard = [[InlineKeyboardButton("➕ New Forwarder", callback_data="new")],
-                [InlineKeyboardButton("📋 My Forwarders", callback_data="my")],
-                [InlineKeyboardButton("❓ Help", callback_data="help")]]
-    
-    await update.message.reply_text(
-        "🎯 **ForwardBot**\n\nForward messages from one source to multiple destinations.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+    bot.send_message(
+        message.chat.id,
+        "🎯 <b>ForwardBot</b>\n\nForward messages from one source to multiple destinations.",
+        reply_markup=main_menu_keyboard()
     )
 
-async def new_forwarder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+@bot.message_handler(commands=['new'])
+def new_forwarder(message):
+    user_id = message.from_user.id
     user_states[user_id] = {'step': 'source'}
-    await update.message.reply_text(
-        "🔄 **Step 1: Set SOURCE**\n\n"
+    bot.send_message(
+        message.chat.id,
+        "🔄 <b>Step 1: Set SOURCE</b>\n\n"
         "Forward any message from the source channel/group to me.\n"
         "Send /cancel to abort."
     )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-    await update.message.reply_text("❌ Cancelled.")
-
-async def my_forwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+@bot.message_handler(commands=['my'])
+def my_forwarders(message):
+    user_id = message.from_user.id
     forwarders = get_user_forwarders(user_id)
     
     if not forwarders:
-        await update.message.reply_text("📭 No forwarders. Use /new to create one.")
+        bot.send_message(message.chat.id, "📭 No forwarders. Use /new to create one.")
         return
     
-    text = "🔁 **Your Forwarders**\n\n"
+    text = "🔁 <b>Your Forwarders</b>\n\n"
     for f in forwarders:
         status = "✅" if f['active'] else "⏸"
         text += f"{status} #{f['id']}: {len(f['destinations'])} dest | {f['mode']}\n"
     
-    await update.message.reply_text(text, parse_mode='Markdown')
+    bot.send_message(message.chat.id, text, reply_markup=forwarder_list_keyboard(user_id))
+
+@bot.message_handler(commands=['cancel'])
+def cancel(message):
+    user_id = message.from_user.id
+    if user_id in user_states:
+        del user_states[user_id]
+    bot.send_message(message.chat.id, "❌ Cancelled.")
+
+@bot.message_handler(commands=['done'])
+def done(message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_states:
+        bot.send_message(message.chat.id, "❌ No active setup.")
+        return
+    
+    state = user_states[user_id]
+    
+    if 'source' not in state or not state.get('destinations'):
+        bot.send_message(message.chat.id, "❌ Need source and at least one destination.")
+        return
+    
+    forwarder_id = create_forwarder(user_id, state['source'], state['destinations'])
+    del user_states[user_id]
+    
+    bot.send_message(message.chat.id, f"✅ Forwarder #{forwarder_id} created!\nUse /my to manage.")
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Admin only.")
+        return
+    
+    msg = message.text.replace("/broadcast", "").strip()
+    if not msg:
+        bot.send_message(message.chat.id, "Usage: /broadcast <message>")
+        return
+    
+    users = get_all_users()
+    sent = 0
+    for uid in users:
+        try:
+            bot.send_message(uid, f"📢 {msg}")
+            sent += 1
+        except:
+            pass
+    
+    bot.send_message(message.chat.id, f"✅ Sent to {sent}/{len(users)} users")
 
 # ========== Callback Handlers ==========
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data
-    chat_id = query.message.chat_id
-    msg_id = query.message.message_id
-    
-    await query.answer()
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    user_id = call.from_user.id
+    data = call.data
     
     if data == "new":
         user_states[user_id] = {'step': 'source'}
-        await send_or_edit(context, chat_id, msg_id,
-            "🔄 **Step 1: Set SOURCE**\n\nForward a message from the source channel/group to me.")
+        bot.edit_message_text(
+            "🔄 <b>Step 1: Set SOURCE</b>\n\nForward a message from the source channel/group to me.",
+            call.message.chat.id,
+            call.message.message_id
+        )
     
     elif data == "my":
         forwarders = get_user_forwarders(user_id)
         if not forwarders:
-            await send_or_edit(context, chat_id, msg_id, "📭 No forwarders.")
+            bot.edit_message_text("📭 No forwarders.", call.message.chat.id, call.message.message_id)
             return
         
-        keyboard = []
+        text = "🔁 <b>Your Forwarders</b>\n\n"
         for f in forwarders:
             status = "✅" if f['active'] else "⏸"
-            keyboard.append([InlineKeyboardButton(f"{status} Forwarder #{f['id']}", callback_data=f"view_{f['id']}")])
-        keyboard.append([InlineKeyboardButton("🔙 Main Menu", callback_data="menu")])
+            text += f"{status} #{f['id']}: {len(f['destinations'])} dest | {f['mode']}\n"
         
-        await send_or_edit(context, chat_id, msg_id, "🔁 **Your Forwarders**", InlineKeyboardMarkup(keyboard))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=forwarder_list_keyboard(user_id))
     
     elif data == "menu":
-        keyboard = [[InlineKeyboardButton("➕ New Forwarder", callback_data="new")],
-                    [InlineKeyboardButton("📋 My Forwarders", callback_data="my")],
-                    [InlineKeyboardButton("❓ Help", callback_data="help")]]
-        await send_or_edit(context, chat_id, msg_id, "🎯 **ForwardBot**", InlineKeyboardMarkup(keyboard))
+        bot.edit_message_text(
+            "🎯 <b>ForwardBot</b>\n\nForward messages from one source to multiple destinations.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=main_menu_keyboard()
+        )
     
     elif data == "help":
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu")]]
-        await send_or_edit(context, chat_id, msg_id,
-            "❓ **Help**\n\n/new - Create forwarder\n/my - List forwarders\n/cancel - Cancel setup",
-            InlineKeyboardMarkup(keyboard))
+        bot.edit_message_text(
+            "❓ <b>Help</b>\n\n/new - Create forwarder\n/my - List forwarders\n/cancel - Cancel setup\n/done - Finish setup",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 Back", callback_data="menu"))
+        )
     
     elif data.startswith("view_"):
         forwarder_id = int(data.split("_")[1])
         f = get_forwarder(forwarder_id)
         if not f:
-            await send_or_edit(context, chat_id, msg_id, "❌ Not found.")
+            bot.edit_message_text("❌ Not found.", call.message.chat.id, call.message.message_id)
             return
         
-        text = f"🔁 **Forwarder #{forwarder_id}**\n"
-        text += f"Source: `{f['source']}`\n"
+        text = f"🔁 <b>Forwarder #{forwarder_id}</b>\n"
+        text += f"Source: <code>{f['source']}</code>\n"
         text += f"Destinations: {len(f['destinations'])}\n"
         text += f"Mode: {f['mode']}\n"
         text += f"Footer: {f['footer'] or '(none)'}\n"
         text += f"Active: {'✅' if f['active'] else '⏸'}"
         
-        keyboard = [
-            [InlineKeyboardButton("🔄 Toggle Mode", callback_data=f"mode_{forwarder_id}")],
-            [InlineKeyboardButton("⏸ Pause/Resume", callback_data=f"active_{forwarder_id}")],
-            [InlineKeyboardButton("🗑 Delete", callback_data=f"del_{forwarder_id}")],
-            [InlineKeyboardButton("🔙 Back", callback_data="my")]
-        ]
-        await send_or_edit(context, chat_id, msg_id, text, InlineKeyboardMarkup(keyboard))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=forwarder_detail_keyboard(forwarder_id))
     
     elif data.startswith("mode_"):
         forwarder_id = int(data.split("_")[1])
@@ -295,33 +319,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if f:
             new_mode = "forward" if f['mode'] == "copy" else "copy"
             update_forwarder(forwarder_id, mode=new_mode)
-        await handle_callback(update, context)
+            bot.answer_callback_query(call.id, f"Mode changed to {new_mode}")
+        handle_callback(call)
     
     elif data.startswith("active_"):
         forwarder_id = int(data.split("_")[1])
         f = get_forwarder(forwarder_id)
         if f:
-            update_forwarder(forwarder_id, active=0 if f['active'] else 1)
-        await handle_callback(update, context)
+            new_active = 0 if f['active'] else 1
+            update_forwarder(forwarder_id, active=new_active)
+            bot.answer_callback_query(call.id, "Status toggled")
+        handle_callback(call)
     
     elif data.startswith("del_"):
         forwarder_id = int(data.split("_")[1])
         delete_forwarder(forwarder_id)
-        await send_or_edit(context, chat_id, msg_id, "✅ Deleted.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my")]]))
+        bot.answer_callback_query(call.id, "Deleted")
+        bot.edit_message_text("✅ Deleted.", call.message.chat.id, call.message.message_id, reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 Back", callback_data="my")))
+    
+    elif data.startswith("footer_"):
+        forwarder_id = int(data.split("_")[1])
+        user_states[user_id] = {'step': 'footer', 'forwarder_id': forwarder_id}
+        bot.send_message(call.message.chat.id, "📝 Send me the footer text to append to every message.\nSend /skip to remove.")
+
+    elif data.startswith("add_dest_"):
+        forwarder_id = int(data.split("_")[2])
+        user_states[user_id] = {'step': 'add_dest', 'forwarder_id': forwarder_id}
+        bot.send_message(call.message.chat.id, "➕ Forward a message from the destination channel/group to me.\nSend /done when finished.")
 
 # ========== Message Handlers ==========
-async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    msg = update.effective_message
-    
-    if not msg.forward_from_chat:
-        await update.message.reply_text("❌ Forward a message from a channel/group.")
-        return
-    
-    chat_id = str(msg.forward_from_chat.id)
+@bot.message_handler(func=lambda message: message.forward_from_chat is not None)
+def handle_forwarded(message):
+    user_id = message.from_user.id
+    chat_id = str(message.forward_from_chat.id)
     
     if user_id not in user_states:
-        await update.message.reply_text("❌ No active setup. Use /new")
+        bot.reply_to(message, "❌ No active setup. Use /new")
         return
     
     state = user_states[user_id]
@@ -330,36 +363,49 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state['source'] = chat_id
         state['step'] = 'destinations'
         state['destinations'] = []
-        await update.message.reply_text(f"✅ Source set.\n\nNow forward messages from destination channels.\nSend /done when finished.")
+        bot.reply_to(message, f"✅ Source set.\n\nNow forward messages from destination channels.\nSend /done when finished.")
     
     elif state.get('step') == 'destinations':
         if chat_id not in state['destinations']:
             state['destinations'].append(chat_id)
-            await update.message.reply_text(f"✅ Destination added: `{chat_id}`")
+            bot.reply_to(message, f"✅ Destination added: <code>{chat_id}</code>")
         else:
-            await update.message.reply_text(f"⚠️ Already added.")
+            bot.reply_to(message, f"⚠️ Already added.")
+    
+    elif state.get('step') == 'add_dest':
+        forwarder_id = state.get('forwarder_id')
+        f = get_forwarder(forwarder_id)
+        if f and chat_id not in f['destinations']:
+            destinations = f['destinations']
+            destinations.append(chat_id)
+            update_forwarder(forwarder_id, destinations=destinations)
+            bot.reply_to(message, f"✅ Destination added to forwarder #{forwarder_id}")
+        else:
+            bot.reply_to(message, f"⚠️ Already added or forwarder not found.")
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id not in user_states:
-        await update.message.reply_text("❌ No active setup.")
-        return
-    
-    state = user_states[user_id]
-    
-    if 'source' not in state or not state.get('destinations'):
-        await update.message.reply_text("❌ Need source and at least one destination.")
-        return
-    
-    forwarder_id = create_forwarder(user_id, state['source'], state['destinations'])
-    del user_states[user_id]
-    
-    await update.message.reply_text(f"✅ Forwarder #{forwarder_id} created!\nUse /my to manage.")
+@bot.message_handler(func=lambda message: message.text and message.text.startswith('/skip'))
+def skip_footer(message):
+    user_id = message.from_user.id
+    if user_id in user_states and user_states[user_id].get('step') == 'footer':
+        forwarder_id = user_states[user_id]['forwarder_id']
+        update_forwarder(forwarder_id, footer='')
+        del user_states[user_id]
+        bot.reply_to(message, f"✅ Footer removed for forwarder #{forwarder_id}")
 
-async def forward_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Forward new messages from source to destinations"""
-    chat_id = str(update.effective_chat.id)
+@bot.message_handler(func=lambda message: message.text and not message.text.startswith('/'))
+def handle_footer(message):
+    user_id = message.from_user.id
+    if user_id in user_states and user_states[user_id].get('step') == 'footer':
+        forwarder_id = user_states[user_id]['forwarder_id']
+        footer = message.text
+        update_forwarder(forwarder_id, footer=footer)
+        del user_states[user_id]
+        bot.reply_to(message, f"✅ Footer set for forwarder #{forwarder_id}")
+
+@bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker', 'animation'])
+def forward_from_source(message):
+    """Forward messages from source channels to destinations"""
+    chat_id = str(message.chat.id)
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -375,57 +421,40 @@ async def forward_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for dest in destinations:
             try:
                 if mode == 'forward':
-                    await context.bot.forward_message(chat_id=int(dest), from_chat_id=chat_id, message_id=update.effective_message.message_id)
+                    bot.forward_message(int(dest), chat_id, message.message_id)
                 else:
-                    await copy_message(context, int(dest), update.effective_message, footer)
+                    if message.text:
+                        text = message.text
+                        if footer:
+                            text += f"\n\n{footer}"
+                        bot.send_message(int(dest), text)
+                    elif message.photo:
+                        caption = message.caption or ""
+                        if footer:
+                            caption += f"\n\n{footer}" if caption else footer
+                        bot.send_photo(int(dest), message.photo[-1].file_id, caption=caption)
+                    elif message.video:
+                        caption = message.caption or ""
+                        if footer:
+                            caption += f"\n\n{footer}"
+                        bot.send_video(int(dest), message.video.file_id, caption=caption)
+                    elif message.document:
+                        caption = message.caption or ""
+                        if footer:
+                            caption += f"\n\n{footer}"
+                        bot.send_document(int(dest), message.document.file_id, caption=caption)
+                    elif message.voice:
+                        bot.send_voice(int(dest), message.voice.file_id)
+                    elif message.sticker:
+                        bot.send_sticker(int(dest), message.sticker.file_id)
             except:
                 pass
-
-# ========== Admin ==========
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only.")
-        return
-    
-    msg = " ".join(context.args)
-    if not msg:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    
-    users = get_all_users()
-    sent = 0
-    for uid in users:
-        try:
-            await context.bot.send_message(uid, f"📢 {msg}")
-            sent += 1
-        except:
-            pass
-    
-    await update.message.reply_text(f"✅ Sent to {sent}/{len(users)}")
 
 # ========== Main ==========
 def main():
     init_db()
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("new", new_forwarder))
-    app.add_handler(CommandHandler("my", my_forwarders))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Messages
-    app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, forward_messages))
-    
-    print("🤖 Bot started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 ForwardBot started!")
+    bot.infinity_polling(skip_pending=True)
 
 if __name__ == "__main__":
     main()
