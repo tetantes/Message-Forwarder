@@ -3,9 +3,12 @@ from telebot import types
 import sqlite3
 import json
 import os
+import time
 import threading
 from datetime import datetime
 from flask import Flask
+import signal
+import sys
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -17,8 +20,11 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
 # Delete any existing webhook
-bot.remove_webhook()
-print("✅ Webhook removed")
+try:
+    bot.remove_webhook()
+    print("✅ Webhook removed")
+except:
+    pass
 
 # ========== Flask for cron ping ==========
 flask_app = Flask(__name__)
@@ -29,9 +35,12 @@ def health():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port, debug=False)
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-threading.Thread(target=run_flask, daemon=True).start()
+# Start Flask in a regular thread (not daemon)
+flask_thread = threading.Thread(target=run_flask, daemon=False)
+flask_thread.start()
+print("✅ Flask server started")
 
 # ========== Database ==========
 DB_PATH = "forward_bot.db"
@@ -391,10 +400,9 @@ def handle_forwarded(message):
         else:
             bot.reply_to(message, f"⚠️ Already added or forwarder not found.")
 
-# ========== CHANNEL POST HANDLER (FIX for forwarding) ==========
+# ========== CHANNEL POST HANDLER ==========
 @bot.channel_post_handler(func=lambda message: True)
 def handle_channel_post(message):
-    """Handle new messages in channels where bot is admin"""
     chat_id = str(message.chat.id)
     
     conn = sqlite3.connect(DB_PATH)
@@ -433,67 +441,8 @@ def handle_channel_post(message):
                         if footer:
                             caption += f"\n\n{footer}"
                         bot.send_document(int(dest), message.document.file_id, caption=caption)
-                    elif message.voice:
-                        bot.send_voice(int(dest), message.voice.file_id)
-                    elif message.sticker:
-                        bot.send_sticker(int(dest), message.sticker.file_id)
-                    elif message.animation:
-                        bot.send_animation(int(dest), message.animation.file_id)
             except Exception as e:
-                print(f"Failed to forward to {dest}: {e}")
-
-# Also handle normal messages (for groups)
-@bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker', 'animation'])
-def handle_group_message(message):
-    """Handle messages in groups where bot is admin"""
-    # Skip if it's a forwarded message (handled separately)
-    if message.forward_from_chat:
-        return
-    
-    chat_id = str(message.chat.id)
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT destinations, mode, footer FROM forwarders WHERE source_chat_id = ? AND active = 1", (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    
-    for row in rows:
-        destinations = json.loads(row[0])
-        mode = row[1]
-        footer = row[2]
-        
-        for dest in destinations:
-            try:
-                if mode == 'forward':
-                    bot.forward_message(int(dest), chat_id, message.message_id)
-                else:
-                    if message.text:
-                        text = message.text
-                        if footer:
-                            text += f"\n\n{footer}"
-                        bot.send_message(int(dest), text)
-                    elif message.photo:
-                        caption = message.caption or ""
-                        if footer:
-                            caption += f"\n\n{footer}" if caption else footer
-                        bot.send_photo(int(dest), message.photo[-1].file_id, caption=caption)
-                    elif message.video:
-                        caption = message.caption or ""
-                        if footer:
-                            caption += f"\n\n{footer}"
-                        bot.send_video(int(dest), message.video.file_id, caption=caption)
-                    elif message.document:
-                        caption = message.caption or ""
-                        if footer:
-                            caption += f"\n\n{footer}"
-                        bot.send_document(int(dest), message.document.file_id, caption=caption)
-                    elif message.voice:
-                        bot.send_voice(int(dest), message.voice.file_id)
-                    elif message.sticker:
-                        bot.send_sticker(int(dest), message.sticker.file_id)
-            except Exception as e:
-                print(f"Failed to forward to {dest}: {e}")
+                print(f"Forward error: {e}")
 
 @bot.message_handler(func=lambda message: message.text and message.text.startswith('/skip'))
 def skip_footer(message):
@@ -514,4 +463,18 @@ def handle_footer(message):
         del user_states[user_id]
         bot.reply_to(message, f"✅ Footer set for forwarder #{forwarder_id}")
 
-# ========== Main =======
+# ========== Main ==========
+def main():
+    init_db()
+    print("🤖 ForwardBot started!")
+    print("✅ Channel post handler registered")
+    
+    # Start polling in the main thread (not background)
+    try:
+        bot.infinity_polling(skip_pending=True)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
