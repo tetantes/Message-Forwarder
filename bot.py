@@ -16,6 +16,10 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
+# ========== DELETE WEBHOOK (FIX for 409 error) ==========
+bot.remove_webhook()
+print("✅ Webhook removed")
+
 # ========== Flask for cron ping ==========
 flask_app = Flask(__name__)
 
@@ -341,7 +345,7 @@ def handle_callback(call):
         forwarder_id = int(data.split("_")[1])
         user_states[user_id] = {'step': 'footer', 'forwarder_id': forwarder_id}
         bot.send_message(call.message.chat.id, "📝 Send me the footer text to append to every message.\nSend /skip to remove.")
-
+    
     elif data.startswith("add_dest_"):
         forwarder_id = int(data.split("_")[2])
         user_states[user_id] = {'step': 'add_dest', 'forwarder_id': forwarder_id}
